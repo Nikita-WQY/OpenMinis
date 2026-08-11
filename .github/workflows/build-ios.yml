@@ -1,0 +1,88 @@
+name: Build iOS (unsigned ipa)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [minis-custom]
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Checkout with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Select Xcode
+        run: |
+          ls /Applications | grep -i xcode || true
+          # 需要 iOS 26.2 SDK => Xcode 26.2+；挑 runner 上最新的 Xcode 26.x
+          XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$XCODE" ]; then XCODE=/Applications/Xcode.app; fi
+          echo "Using $XCODE"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+
+      - name: Install build tools
+        run: |
+          brew install ninja llvm libarchive pkg-config meson
+
+      - name: Provider customization config
+        run: |
+          cd src/ios
+          for f in Configs/*.xcconfig.example; do cp "$f" "${f%.example}"; done
+          ls Configs/*.xcconfig || true
+
+      - name: Cache native deps
+        id: deps-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps/libs
+            deps/include
+            deps/frameworks
+            deps/resources
+            deps/lame-build
+          key: native-deps-${{ runner.os }}-${{ hashFiles('.gitmodules', 'deps/*.sh') }}
+
+      - name: Build native deps (lame -> ffmpeg -> ish -> rootfs)
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        run: |
+          ./deps/build_lame.sh
+          ./deps/build_ffmpeg.sh
+          ./deps/build_ish.sh
+          ./deps/prepare_alpine_rootfs.sh
+
+      - name: Prepare rootfs (cache hit fallback)
+        if: steps.deps-cache.outputs.cache-hit == 'true'
+        run: |
+          # rootfs 每次都重新准备（未必被缓存覆盖），脚本自带幂等
+          ./deps/prepare_alpine_rootfs.sh || true
+
+      - name: Build app (unsigned)
+        run: |
+          xcodebuild -project src/ios/Minis.xcodeproj \
+            -scheme Minis \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/dd \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Package unsigned ipa
+        run: |
+          APP=$(find build/dd/Build/Products -name '*.app' -maxdepth 3 | head -1)
+          echo "App bundle: $APP"
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry Minis-unsigned.ipa Payload
+          ls -lh Minis-unsigned.ipa
+
+      - name: Upload ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Minis-unsigned-ipa-${{ github.sha }}
+          path: Minis-unsigned.ipa
+          retention-days: 30
