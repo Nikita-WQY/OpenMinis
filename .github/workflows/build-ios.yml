@@ -27,7 +27,7 @@ jobs:
 
       - name: Install build tools
         run: |
-          brew install ninja llvm libarchive pkg-config meson
+          brew install ninja llvm lld libarchive pkg-config meson
 
       - name: Provider customization config
         run: |
