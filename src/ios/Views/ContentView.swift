@@ -71,6 +71,54 @@ private func probeRowHeight(_ h: CGFloat, _ tag: String) {
 }
 #endif
 
+/// Kelivo chat-import UI (file picker → role picker → result alert), hoisted
+/// out of ContentView.body as a ViewModifier: the body expression is already
+/// at the type-checker's limit, and adding these three modifiers inline made
+/// it fail with "unable to type-check this expression in reasonable time"
+/// (CI run 31610842967). A ViewModifier's body is type-checked separately.
+private struct ChatImportUI: ViewModifier {
+    @Binding var showFilePicker: Bool
+    @Binding var pendingExport: ParsedChatExport?
+    @Binding var showRolePicker: Bool
+    @Binding var showResultAlert: Bool
+    let resultMessage: String?
+    let onFile: (Result<URL, Error>) -> Void
+    let onPickRole: (ParsedChatExport, String) -> Void
+
+    private static let contentTypes: [UTType] = [
+        UTType(filenameExtension: "md") ?? .plainText, .plainText, .text,
+    ]
+
+    func body(content: Content) -> some View {
+        content
+            .fileImporter(
+                isPresented: $showFilePicker,
+                allowedContentTypes: Self.contentTypes
+            ) { result in
+                onFile(result)
+            }
+            .confirmationDialog(
+                "哪个名字是你自己？",
+                isPresented: $showRolePicker,
+                titleVisibility: .visible
+            ) {
+                if let export = pendingExport {
+                    ForEach(export.roleNames, id: \.self) { name in
+                        Button(name) { onPickRole(export, name) }
+                    }
+                }
+                Button("取消", role: .cancel) { pendingExport = nil }
+            } message: {
+                Text("选中的角色会显示成你的气泡，其余的显示成对方。")
+            }
+            .alert("导入聊天记录", isPresented: $showResultAlert) {
+                Button("好", role: .cancel) {}
+            } message: {
+                Text(resultMessage ?? "")
+            }
+    }
+}
+
 /// Sheets triggered from the toolbar menu, consolidated into a single `.sheet(item:)`.
 enum ToolSheet: String, Identifiable {
     case settings
@@ -571,31 +619,15 @@ struct ContentView: View {
         .sheet(isPresented: $showExportPreview) {
             ExportPreviewSheet(fileURL: exportFileURL, summary: exportSummary)
         }
-        .fileImporter(
-            isPresented: $showImportFilePicker,
-            allowedContentTypes: [UTType(filenameExtension: "md") ?? .plainText, .plainText, .text]
-        ) { result in
-            handleChatImportFile(result)
-        }
-        .confirmationDialog(
-            "哪个名字是你自己？",
-            isPresented: $showImportRolePicker,
-            titleVisibility: .visible
-        ) {
-            if let export = pendingImportExport {
-                ForEach(export.roleNames, id: \.self) { name in
-                    Button(name) { startChatImport(export, userRoleName: name) }
-                }
-            }
-            Button("取消", role: .cancel) { pendingImportExport = nil }
-        } message: {
-            Text("选中的角色会显示成你的气泡，其余的显示成对方。")
-        }
-        .alert("导入聊天记录", isPresented: $showImportResultAlert) {
-            Button("好", role: .cancel) {}
-        } message: {
-            Text(importResultMessage ?? "")
-        }
+        .modifier(ChatImportUI(
+            showFilePicker: $showImportFilePicker,
+            pendingExport: $pendingImportExport,
+            showRolePicker: $showImportRolePicker,
+            showResultAlert: $showImportResultAlert,
+            resultMessage: importResultMessage,
+            onFile: handleChatImportFile,
+            onPickRole: startChatImport
+        ))
         .overlay {
             if isExporting {
                 ZStack {
