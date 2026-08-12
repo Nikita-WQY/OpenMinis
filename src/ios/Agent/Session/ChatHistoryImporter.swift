@@ -186,19 +186,22 @@ final class ChatHistoryImporter {
         let title = (export.title?.isEmpty == false) ? export.title! : "导入的聊天"
         let session = await store.createSession(modelId: modelId, title: title)
 
-        // Missing/unparsable timestamps fall back to previous + 1s so relative
-        // order is preserved (sort_order follows array order regardless).
+        // createdAt drives more than display: ChatStore.repairSessionIfNeeded
+        // rewrites sort_order to canonical (created_at, id) order on session
+        // open. Kelivo timestamps have 1-second resolution, so a question and
+        // its reply often share a second — with random UUIDs that "repair"
+        // swaps roughly half of such pairs. Keep createdAt strictly increasing
+        // (ties bumped by 10ms, invisible in UI) so canonical order always
+        // equals file order. Missing/unparsable timestamps fall back to
+        // previous + 1s.
         var rawMessages: [RawMessage] = []
-        var lastTimestamp = incoming.first?.timestamp ?? Date()
+        var lastTimestamp = (incoming.first?.timestamp ?? Date()).addingTimeInterval(-1)
         for message in incoming {
-            let timestamp: Date
-            if let parsed = message.timestamp {
-                timestamp = parsed
-                lastTimestamp = parsed
-            } else {
-                lastTimestamp = lastTimestamp.addingTimeInterval(1)
-                timestamp = lastTimestamp
+            var timestamp = message.timestamp ?? lastTimestamp.addingTimeInterval(1)
+            if timestamp <= lastTimestamp {
+                timestamp = lastTimestamp.addingTimeInterval(0.01)
             }
+            lastTimestamp = timestamp
             rawMessages.append(RawMessage(
                 id: UUID().uuidString,
                 sessionId: session.id,
