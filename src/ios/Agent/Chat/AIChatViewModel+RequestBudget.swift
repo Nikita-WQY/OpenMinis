@@ -241,23 +241,30 @@ extension AIChatViewModel {
             .appendingPathComponent("browser", isDirectory: true)
     }
 
+    /// Base container for the App-Group-hosted roots below. Builds re-signed
+    /// with a personal team (sideload) lose the group.com.openminis.app
+    /// entitlement, so containerURL returns nil there — fall back to the
+    /// app's own Library so launch survives. Files-app exposure via the
+    /// FileProvider extension is unavailable without the entitlement anyway.
+    nonisolated static var minisAppGroupContainerBase: URL {
+        FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: SharedContainerStore.appGroupID
+        ) ?? FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first!
+    }
+
     /// App Group container root for FileProvider-visible directories.
     /// Everything under this path is exposed to iOS Files via the replicated
     /// FileProvider extension. Keep ONLY user-facing subdirs (shared, skills,
     /// memory) here — anything else leaks into "On My iPhone → Minis".
     nonisolated static var minisAppGroupRoot: URL {
-        FileManager.default.containerURL(
-            forSecurityApplicationGroupIdentifier: SharedContainerStore.appGroupID
-        )!.appendingPathComponent("MinisFileProvider", isDirectory: true)
+        minisAppGroupContainerBase.appendingPathComponent("MinisFileProvider", isDirectory: true)
     }
 
     /// App Group subdirectory for private metadata that must NOT be exposed
     /// to iOS Files (mounted-folders.json, FileProvider extension logs, etc).
     /// Sibling of `minisAppGroupRoot` inside the same App Group container.
     nonisolated static var minisConfigRoot: URL {
-        let url = FileManager.default.containerURL(
-            forSecurityApplicationGroupIdentifier: SharedContainerStore.appGroupID
-        )!.appendingPathComponent("MinisConfig", isDirectory: true)
+        let url = minisAppGroupContainerBase.appendingPathComponent("MinisConfig", isDirectory: true)
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }
