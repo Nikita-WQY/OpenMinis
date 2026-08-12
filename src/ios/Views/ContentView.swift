@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 private let shareLog = AppLogger(category: "Share")
 private let draftLog = AppLogger(category: "DraftSession")
@@ -190,6 +191,13 @@ struct ContentView: View {
     @State private var showAlarmList = false
     @State private var hasAlarms = false
     @State private var activeToolSheet: ToolSheet?
+    // Chat history import (Kelivo md/txt export)
+    @State private var showImportFilePicker = false
+    /// Parsed export waiting for the "which role is you?" confirmation.
+    @State private var pendingImportExport: ParsedChatExport?
+    @State private var showImportRolePicker = false
+    @State private var importResultMessage: String?
+    @State private var showImportResultAlert = false
     #if DEBUG
     // [debug] Keep the screen awake (disable the idle/auto-lock timer) while the
     // app is in the foreground. Memory-only on purpose — NOT persisted, so it
@@ -562,6 +570,31 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showExportPreview) {
             ExportPreviewSheet(fileURL: exportFileURL, summary: exportSummary)
+        }
+        .fileImporter(
+            isPresented: $showImportFilePicker,
+            allowedContentTypes: [UTType(filenameExtension: "md") ?? .plainText, .plainText, .text]
+        ) { result in
+            handleChatImportFile(result)
+        }
+        .confirmationDialog(
+            "哪个名字是你自己？",
+            isPresented: $showImportRolePicker,
+            titleVisibility: .visible
+        ) {
+            if let export = pendingImportExport {
+                ForEach(export.roleNames, id: \.self) { name in
+                    Button(name) { startChatImport(export, userRoleName: name) }
+                }
+            }
+            Button("取消", role: .cancel) { pendingImportExport = nil }
+        } message: {
+            Text("选中的角色会显示成你的气泡，其余的显示成对方。")
+        }
+        .alert("导入聊天记录", isPresented: $showImportResultAlert) {
+            Button("好", role: .cancel) {}
+        } message: {
+            Text(importResultMessage ?? "")
         }
         .overlay {
             if isExporting {
@@ -1692,6 +1725,12 @@ struct ContentView: View {
                     } label: {
                         Label("Browser Settings", systemImage: "globe.badge.chevron.backward")
                     }
+                    Divider()
+                    Button {
+                        showImportFilePicker = true
+                    } label: {
+                        Label("导入聊天记录", systemImage: "square.and.arrow.down")
+                    }
                     #if DEBUG
                     Divider()
                     // [debug] Keep Screen Awake — disables auto-lock while the app
@@ -1710,6 +1749,55 @@ struct ContentView: View {
                         .scaledToFit()
                         .frame(width: 24, height: 24)
                 }
+            }
+        }
+    }
+
+    // MARK: - Chat History Import (Kelivo)
+
+    /// Read the picked export file (security-scoped), parse it, then ask
+    /// which role name belongs to the user before importing.
+    private func handleChatImportFile(_ result: Result<URL, Error>) {
+        switch result {
+        case .success(let url):
+            let accessing = url.startAccessingSecurityScopedResource()
+            defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+            guard let data = try? Data(contentsOf: url),
+                  let raw = String(data: data, encoding: .utf8) else {
+                importResultMessage = "读不了这个文件，确认它是 Kelivo 导出的 md/txt 哦"
+                showImportResultAlert = true
+                return
+            }
+            let export = KelivoChatExportParser.parse(raw)
+            guard !export.messages.isEmpty else {
+                importResultMessage = "没解析到任何消息，检查一下文件内容？"
+                showImportResultAlert = true
+                return
+            }
+            pendingImportExport = export
+            showImportRolePicker = true
+        case .failure(let error):
+            importResultMessage = "选文件失败：\(error.localizedDescription)"
+            showImportResultAlert = true
+        }
+    }
+
+    /// Run the import and jump into the new session (mirrors the duplicate flow).
+    private func startChatImport(_ export: ParsedChatExport, userRoleName: String) {
+        pendingImportExport = nil
+        Task { @MainActor in
+            let modelId = sessions.first?.modelId ?? ""
+            let session = await ChatHistoryImporter.shared.importExport(
+                export,
+                userRoleName: userRoleName,
+                modelId: modelId
+            )
+            if let session {
+                refreshSessionList()
+                openSession(session.id)
+            } else {
+                importResultMessage = "导入失败了，一条消息都没存进去"
+                showImportResultAlert = true
             }
         }
     }
