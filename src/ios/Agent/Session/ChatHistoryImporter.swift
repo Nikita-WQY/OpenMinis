@@ -159,10 +159,6 @@ final class ChatHistoryImporter {
     static let shared = ChatHistoryImporter()
     private init() {}
 
-    /// ChatStore prunes sessions above 2048 messages; stay under it so freshly
-    /// imported history isn't immediately deleted.
-    private static let maxImportedMessages = 2000
-
     /// - Parameters:
     ///   - userRoleName: the parsed role name whose messages become `.user`
     ///     (everything else becomes `.assistant`).
@@ -172,11 +168,9 @@ final class ChatHistoryImporter {
         userRoleName: String,
         modelId: String
     ) async -> ChatSession? {
-        var incoming = export.messages.filter { !$0.text.isEmpty }
-        if incoming.count > Self.maxImportedMessages {
-            logger.info("[Import] \(incoming.count) messages exceed cap; keeping most recent \(Self.maxImportedMessages)")
-            incoming = Array(incoming.suffix(Self.maxImportedMessages))
-        }
+        // No size cap: pruneOldMessages is a no-op now (permanent history),
+        // so imports keep every message however long the export is.
+        let incoming = export.messages.filter { !$0.text.isEmpty }
         guard !incoming.isEmpty else {
             logger.error("[Import] No non-empty messages to import")
             return nil

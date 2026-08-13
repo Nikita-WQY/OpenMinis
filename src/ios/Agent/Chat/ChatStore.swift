@@ -506,6 +506,19 @@ actor ChatStore {
         // (push only after priority=0 drains in each batch).
         addColumnIfMissing(table: "sync_dirty_records", column: "priority", definition: "INTEGER NOT NULL DEFAULT 0")
         addColumnIfMissing(table: "sync_dirty_records", column: "created_at", definition: "REAL NOT NULL DEFAULT 0")
+        // [message-version-groups batch 0] Kelivo-style multi-version messages.
+        // One "group" is one logical message slot; each row is one version of
+        // it, and exactly one version per group is selected (shown + sent as
+        // context). Schema groundwork only — no reader or writer uses these
+        // columns yet, so behavior is unchanged.
+        addColumnIfMissing(table: "messages", column: "group_id", definition: "TEXT")
+        addColumnIfMissing(table: "messages", column: "version", definition: "INTEGER NOT NULL DEFAULT 1")
+        addColumnIfMissing(table: "messages", column: "selected", definition: "INTEGER NOT NULL DEFAULT 1")
+        // Every existing message becomes its own single-version selected group.
+        // Runs on every launch (the WHERE keeps re-runs cheap) so rows written
+        // by paths that don't know about group_id — e.g. sync hydrate inserts —
+        // are normalized on next launch too.
+        exec("UPDATE messages SET group_id = id WHERE group_id IS NULL")
 
         // One-shot cleanup: drop legacy v1 dirty rows that have a v2
         // counterpart. Under the V2 engine these have no consumer (the
@@ -3170,65 +3183,13 @@ actor ChatStore {
         )
     }
 
-    /// Maximum messages per session. Oldest messages beyond this limit are
-    /// deleted after each appendMessages call.
-    private static let pruneThreshold = 2048
-
-    /// Delete the oldest messages when a session exceeds `pruneThreshold`.
-    ///
-    /// Safety rules:
-    /// - Only runs when message count strictly exceeds the threshold.
-    /// - Uses `DELETE ... WHERE id IN (SELECT id ... LIMIT N)` to delete an
-    ///   exact number of rows, immune to duplicate sort_order values.
-    /// - Never deletes more than `totalCount - pruneThreshold` rows.
-    /// - Verifies the count-to-delete is positive and less than totalCount
-    ///   (always keeps at least `pruneThreshold` messages).
-    /// - Also cleans up stale compact markers.
+    /// [message-version-groups batch 0] Pruning disabled: chat history must
+    /// never be deleted (Kelivo-style permanent history). The old
+    /// implementation deleted the oldest rows beyond 2048 per session after
+    /// each appendMessages call; long-session load performance will be
+    /// addressed with lazy loading instead. Kept as a no-op so call sites
+    /// stay untouched.
     func pruneOldMessages(sessionId: String) {
-        // 1. Count total messages
-        var countStmt: OpaquePointer?
-        let countSql = "SELECT COUNT(*) FROM messages WHERE session_id = ?"
-        guard sqlite3_prepare_v2(db, countSql, -1, &countStmt, nil) == SQLITE_OK else { return }
-        sqlite3_bind_text(countStmt, 1, (sessionId as NSString).utf8String, -1, nil)
-        guard sqlite3_step(countStmt) == SQLITE_ROW else {
-            sqlite3_finalize(countStmt)
-            return
-        }
-        let totalCount = Int(sqlite3_column_int64(countStmt, 0))
-        sqlite3_finalize(countStmt)
-
-        // Phase A: DO NOT call deleteOldCompactMarkers here. Compact markers are
-        // append-only archive and must survive appendMessages. Old markers are only
-        // removed when the session itself is deleted (deleteSession path).
-
-        guard totalCount > Self.pruneThreshold else { return }
-
-        let deleteCount = totalCount - Self.pruneThreshold
-
-        // 2. Safety: deleteCount must be positive and must keep at least pruneThreshold rows
-        guard deleteCount > 0 && deleteCount < totalCount else {
-            logger.warning("[Prune] Unexpected deleteCount=\(deleteCount) total=\(totalCount) — skipping")
-            return
-        }
-
-        // 3. Delete exactly deleteCount oldest rows by id (immune to sort_order duplicates)
-        let delSql = """
-            DELETE FROM messages WHERE id IN (
-                SELECT id FROM messages WHERE session_id = ?
-                ORDER BY sort_order ASC, created_at ASC, id ASC
-                LIMIT ?
-            )
-        """
-        var delStmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, delSql, -1, &delStmt, nil) == SQLITE_OK {
-            sqlite3_bind_text(delStmt, 1, (sessionId as NSString).utf8String, -1, nil)
-            sqlite3_bind_int64(delStmt, 2, Int64(deleteCount))
-            sqlite3_step(delStmt)
-        }
-        sqlite3_finalize(delStmt)
-
-        let deleted = Int(sqlite3_changes(db))
-        logger.info("[Prune] session \(sessionId.prefix(8)): deleted \(deleted) oldest messages (was \(totalCount), threshold \(Self.pruneThreshold))")
     }
 
     /// Delete all compact markers except the latest one.
