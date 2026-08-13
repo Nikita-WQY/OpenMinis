@@ -375,7 +375,11 @@ private struct BridgedAssistantFooterV3: View {
         let showTyping = bridge.isActiveMessage && (!hasVisibleContent || message.isAwaitingModelResponse)
         let showError = message.error != nil
         let showResume = bridge.canResume && message.error == nil
-        let showUsageRow = message.streamInterruptCount > 0 || bridge.showUsage
+        // [T-usage-always-visible] Usage capsule is persistent (her request):
+        // every FINISHED assistant reply shows it, no tap needed. Hidden while
+        // the reply is still streaming — mid-turn the numbers jump on every
+        // tool-loop iteration, she wants the final tally only.
+        let showUsageRow = message.streamInterruptCount > 0 || (message.usage != nil && !bridge.isActiveMessage)
         return showTyping || showError || showResume || showUsageRow || pagerInfo != nil
     }
 
@@ -404,15 +408,17 @@ private struct BridgedAssistantFooterV3: View {
                 )
             }
 
-            // Token usage
-            if message.streamInterruptCount > 0 || bridge.showUsage {
+            // Token usage — [T-usage-always-visible] persistent once the
+            // reply has FINISHED (her request): mid-turn the numbers jump on
+            // every tool-loop iteration, so the still-streaming bubble
+            // (isActiveMessage) hides it until the final tally.
+            if message.streamInterruptCount > 0 || (message.usage != nil && !bridge.isActiveMessage) {
                 HStack(spacing: 6) {
                     if message.streamInterruptCount > 0 {
                         streamInterruptBadge(message.streamInterruptCount)
                     }
-                    if bridge.showUsage, let usage = message.usage {
+                    if let usage = message.usage, !bridge.isActiveMessage {
                         usageCapsule(usage)
-                            .opacity(bridge.usageContentVisible ? 1 : 0)
                     }
                     Spacer()
                 }
