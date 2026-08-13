@@ -3375,7 +3375,7 @@ actor ChatStore {
     /// the batch-0 backfill; they all get re-stamped onto the first tail row's
     /// group. Later rerolls: the tail already shares that group, the UPDATE is
     /// a no-op re-stamp. Returns nil when there is nothing after the boundary.
-    func versionizeMessagesAfter(sessionId: String, keepCount: Int) -> (groupId: String, nextVersion: Int)? {
+    func versionizeMessagesAfter(sessionId: String, keepCount: Int) -> (groupId: String, version: Int)? {
         guard keepCount > 0 else { return nil }
         invalidateSessionListCache()
 
