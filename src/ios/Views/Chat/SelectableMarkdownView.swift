@@ -5141,6 +5141,23 @@ final class SelectableMarkdownTextView: UITextView, UIGestureRecognizerDelegate 
         onSpeakText?(plainTextWithTables(in: selectedRange))
     }
 
+    // MARK: - [message-version-groups] Version actions in the selection menu
+
+    /// Reroll the last reply (Kelivo-style). Plumbed from the cell bridge like
+    /// onReadAloud; nil on non-last replies or while a run is in flight.
+    var onRerollLast: (() -> Void)?
+    /// Delete the currently selected version of this reply's group. nil when
+    /// the group has a single version (nothing to fall back to).
+    var onDeleteVersion: (() -> Void)?
+
+    @objc func rerollFromMenu(_ sender: Any?) {
+        onRerollLast?()
+    }
+
+    @objc func deleteVersionFromMenu(_ sender: Any?) {
+        onDeleteVersion?()
+    }
+
     /// Copies the rendered rich text (RTF) to the pasteboard.
     @objc func copyRichText(_ sender: Any?) {
         let range = selectedRange.length > 0 ? selectedRange : NSRange(location: 0, length: attributedText.length)
@@ -5230,6 +5247,23 @@ final class SelectableMarkdownTextView: UITextView, UIGestureRecognizerDelegate 
                 title: String(localized: "Read from Start"),
                 image: UIImage(systemName: "speaker.wave.2"),
                 action: #selector(readReplyFromMenu(_:))
+            ))
+        }
+        // [message-version-groups] Kelivo-style reroll + version delete, in
+        // the menu she actually long-presses (the footer overlay menu is a
+        // zero-size target — undiscoverable).
+        if onRerollLast != nil {
+            extras.append(UICommand(
+                title: String(localized: "Regenerate"),
+                image: UIImage(systemName: "arrow.counterclockwise"),
+                action: #selector(rerollFromMenu(_:))
+            ))
+        }
+        if onDeleteVersion != nil {
+            extras.append(UICommand(
+                title: String(localized: "Delete This Version"),
+                image: UIImage(systemName: "trash"),
+                action: #selector(deleteVersionFromMenu(_:))
             ))
         }
         let extrasMenu = UIMenu(title: "", options: .displayInline, children: extras)
@@ -6376,6 +6410,10 @@ struct SelectableMarkdownView: UIViewRepresentable {
     var onReadAloud: (() -> Void)?
     /// [T-selection-menu-minis-tts] "Read Selection" (selected text) via Minis TTS.
     var onSpeakText: ((String) -> Void)?
+    /// [message-version-groups] "Regenerate" (last reply only).
+    var onRerollLast: (() -> Void)?
+    /// [message-version-groups] "Delete This Version" (multi-version groups).
+    var onDeleteVersion: (() -> Void)?
     @Environment(\.openURL) private var openURL
 
     func makeCoordinator() -> Coordinator {
@@ -6419,6 +6457,8 @@ struct SelectableMarkdownView: UIViewRepresentable {
         textView.onCopyScreenshot = onCopyScreenshot
         textView.onReadAloud = onReadAloud
         textView.onSpeakText = onSpeakText
+        textView.onRerollLast = onRerollLast
+        textView.onDeleteVersion = onDeleteVersion
         #if DEBUG
         // [T-ios-markdown-rerender-burst] makeUIView creates a FRESH textView +
         // resets lastMarkdown="", forcing the next updateUIView through a full
@@ -6439,6 +6479,8 @@ struct SelectableMarkdownView: UIViewRepresentable {
         textView.onCopyScreenshot = onCopyScreenshot
         textView.onReadAloud = onReadAloud
         textView.onSpeakText = onSpeakText
+        textView.onRerollLast = onRerollLast
+        textView.onDeleteVersion = onDeleteVersion
 
         let currentFontSize = FontSettings.shared.scaledMessage(16.5)
         let fontChanged = context.coordinator.lastFontSize != currentFontSize

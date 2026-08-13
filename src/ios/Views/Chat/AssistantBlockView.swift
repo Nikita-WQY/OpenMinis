@@ -15,6 +15,9 @@ struct AssistantBlockView: View {
     /// down to SelectableMarkdownView (nil for non-text or streaming contexts).
     var onReadAloud: (() -> Void)?
     var onSpeakText: ((String) -> Void)?
+    // [message-version-groups] Selection-menu reroll / version delete.
+    var onRerollLast: (() -> Void)?
+    var onDeleteVersion: (() -> Void)?
     var browserPool: BrowserTabPool?
     var toolSnapshots: [ToolSnapshotItem] = []
     @Binding var highlightedBlockId: UUID?
@@ -122,7 +125,9 @@ struct AssistantBlockView: View {
             onTapBlank: onTapBlank,
             onCopyScreenshot: onCopyScreenshot,
             onReadAloud: onReadAloud,
-            onSpeakText: onSpeakText
+            onSpeakText: onSpeakText,
+            onRerollLast: onRerollLast,
+            onDeleteVersion: onDeleteVersion
         )
         .fixedSize(horizontal: false, vertical: true)
         .modifier(MinisOpenURLHandler())

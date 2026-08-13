@@ -238,6 +238,12 @@ private struct BridgedAssistantBlockV3: View {
             // rule as the overlay context menu); Read Selection stays available.
             onReadAloud: bridge.isStreaming ? nil : bridge.onReadAloud,
             onSpeakText: bridge.onSpeakText,
+            // [message-version-groups] nil-gated upstream: onRerollLast only
+            // on the last reply while idle; onDeleteVersion only when the
+            // group has siblings (checked at tap time in the bridge closure,
+            // so gate visibility here on versionInfo for the menu item).
+            onRerollLast: bridge.onRerollLast,
+            onDeleteVersion: (message.versionInfo?.total ?? 1) > 1 ? bridge.onDeleteVersion : nil,
             browserPool: bridge.browserPool,
             toolSnapshots: bridge.toolSnapshots,
             highlightedBlockId: .constant(nil),
@@ -2137,9 +2143,16 @@ extension CollectionViewMessageListV3 {
                     // double-tap), the toggle triggers a snapshot refresh
                     // which re-evaluates this condition.
                     let isLastAssistant = (message.id == messages.last(where: { $0.role == .assistant })?.id)
+                    // [T-usage-always-visible] usage != nil: every finished
+                    // reply renders its usage capsule now, so it needs its
+                    // footer cell — the old last-assistant-only gate was why
+                    // capsules vanished from all but the newest reply.
+                    // versionInfo: the ‹n/N› pager also lives in the footer.
                     let needsFooter = isLastAssistant
                         || message.error != nil
                         || message.streamInterruptCount > 0
+                        || message.usage != nil
+                        || (message.versionInfo?.total ?? 1) > 1
                         || (cellBridges[message.id]?.showUsage == true)
                     if needsFooter {
                         newItems.append(.assistantFooter(message.id))
