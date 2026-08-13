@@ -2349,6 +2349,9 @@ struct AIChatView: View {
                 onScreenshotImage: { image in
                     screenshotPreview = ChatScreenshotPreview(image: image)
                 },
+                onSelectVersion: { gid, v in vm.selectVersion(groupId: gid, version: v) },
+                onRerollLast: { vm.rerollLastReply(); vm.forceScrollToBottom.send() },
+                onDeleteVersion: { gid, v in vm.deleteVersion(groupId: gid, version: v) },
                 maxContentWidth: maxContentWidth ?? 0,
                 floatingBarHeight: floatingBarHeight,
                 inputBarHeight: inputBarHeight

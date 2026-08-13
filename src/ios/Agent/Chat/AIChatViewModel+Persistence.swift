@@ -313,6 +313,7 @@ extension AIChatViewModel {
                     let msg = raw.toChatMessage(mediaResolver: resolver, showThinking: showThinking)
                     msg.sourceSortOrder = raw.sortOrder
                     msg.lastSourceSortOrder = raw.sortOrder
+                    msg.groupId = raw.groupId  // [message-version-groups] pager key
                     currentAssistant = msg
                     loadedUIMessages.append(msg)
                 }
@@ -675,6 +676,7 @@ extension AIChatViewModel {
         // complete data — prevents tables/images from rendering without snapshots.
         toolSnapshots = loadedSnapshots
         messages = loadedUIMessages
+        refreshVersionInfo()  // [message-version-groups] pager data
 
         // [T-ios-scroll-suspend-leak] UI/DB consistency snapshot. `rawMessages` is
         // the source of truth (one row per persisted turn/iteration); `messages`
@@ -1339,13 +1341,22 @@ extension AIChatViewModel {
             )
         }
 
-        return RawMessage(
+        var raw = RawMessage(
             id: UUID().uuidString, sessionId: sessionId,
             role: msg.role == .user ? .user : .assistant,
             parts: parts, createdAt: Date(), tokenUsage: storedUsage,
             reasoningContent: reasoningContent ?? msg.reasoningContent,
             streamInterruptCount: streamInterruptCount
         )
+        // [message-version-groups] During a reroll every persisted row of the
+        // regenerated turn joins the rerolled group as its newest version.
+        // Outside a reroll the stamp is nil and the row stays its own group.
+        if let stamp = pendingVersionStamp {
+            raw.groupId = stamp.groupId
+            raw.version = stamp.version
+            raw.selected = true
+        }
+        return raw
     }
 
     /// Phase B: Return the LLM-facing view of agentHistory.

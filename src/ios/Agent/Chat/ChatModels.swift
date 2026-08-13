@@ -35,6 +35,26 @@ struct AttachmentMeta: Identifiable, Equatable {
     }
 }
 
+/// [message-version-groups] Pager data for one bubble. `versions` holds the
+/// group's EXISTING version numbers ascending — deletions leave gaps (e.g.
+/// [1, 3]), so the pager steps through this list by index and renders
+/// "index+1 / count", never raw version-number arithmetic.
+struct MessageVersionInfo: Equatable {
+    var versions: [Int]
+    /// Currently selected version NUMBER (an element of `versions`).
+    var selected: Int
+    var total: Int { versions.count }
+    var selectedIndex: Int { versions.firstIndex(of: selected) ?? max(0, versions.count - 1) }
+    var previousVersion: Int? {
+        let idx = selectedIndex
+        return idx > 0 ? versions[idx - 1] : nil
+    }
+    var nextVersion: Int? {
+        let idx = selectedIndex
+        return idx + 1 < versions.count ? versions[idx + 1] : nil
+    }
+}
+
 final class ChatMessage: Identifiable, ObservableObject {
     let id = UUID()
     let role: ChatMessageRole
@@ -78,6 +98,13 @@ final class ChatMessage: Identifiable, ObservableObject {
     var lastSourceSortOrder: Int?
     /// Links back to the QueuedPrompt so we can withdraw it.
     var queuedPromptId: UUID?
+    /// [message-version-groups] Version group of the FIRST raw row folded
+    /// into this bubble. nil = single-version (no pager).
+    var groupId: String?
+    /// [message-version-groups] Pager data for this bubble's group. @Published
+    /// so the footer cell re-renders when a reroll finishes or a version is
+    /// switched/deleted. nil or total <= 1 renders no pager.
+    @Published var versionInfo: MessageVersionInfo?
     let timestamp = Date()
 
     init(role: ChatMessageRole, content: String, blocks: [AssistantBlock] = [], isQueued: Bool = false) {

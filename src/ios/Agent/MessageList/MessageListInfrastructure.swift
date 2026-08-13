@@ -1015,4 +1015,13 @@ final class CellStateBridgeV2: ObservableObject {
     @Published var usageContentVisible: Bool = false
     /// Compact summary — presented from overlay outside cell tree for animation.
     var onShowCompactSummary: ((String) -> Void)?
+    /// [message-version-groups] Switch this bubble's group to the given
+    /// version number (pager arrows).
+    @Published var onSelectVersion: ((Int) -> Void)?
+    /// [message-version-groups] Reroll the last reply (only set on the last
+    /// assistant bubble while idle).
+    @Published var onRerollLast: (() -> Void)?
+    /// [message-version-groups] Delete the currently selected version of this
+    /// bubble's group (only set when the group has more than one version).
+    @Published var onDeleteVersion: (() -> Void)?
 }

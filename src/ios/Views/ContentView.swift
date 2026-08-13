@@ -87,6 +87,7 @@ private struct ChatImportUI: ViewModifier {
 
     private static let contentTypes: [UTType] = [
         UTType(filenameExtension: "md") ?? .plainText, .plainText, .text,
+        .json,  // [message-version-groups] Minis' own session export
     ]
 
     func body(content: Content) -> some View {
@@ -1794,8 +1795,23 @@ struct ContentView: View {
         case .success(let url):
             let accessing = url.startAccessingSecurityScopedResource()
             defer { if accessing { url.stopAccessingSecurityScopedResource() } }
-            guard let data = try? Data(contentsOf: url),
-                  let raw = String(data: data, encoding: .utf8) else {
+            guard let data = try? Data(contentsOf: url) else {
+                importResultMessage = "读不了这个文件，确认它是 Kelivo 导出的 md/txt 或 Minis 导出的 json 哦"
+                showImportResultAlert = true
+                return
+            }
+            // [message-version-groups] Minis' own JSON export — roles are
+            // already user/assistant, no role picker; import directly.
+            if url.pathExtension.lowercased() == "json" {
+                if let parsed = MinisJSONExportParser.parse(data) {
+                    startMinisImport(parsed)
+                } else {
+                    importResultMessage = "这个 json 不是 Minis 导出的会话格式哦（zip 包要先解压）"
+                    showImportResultAlert = true
+                }
+                return
+            }
+            guard let raw = String(data: data, encoding: .utf8) else {
                 importResultMessage = "读不了这个文件，确认它是 Kelivo 导出的 md/txt 哦"
                 showImportResultAlert = true
                 return
@@ -1811,6 +1827,26 @@ struct ContentView: View {
         case .failure(let error):
             importResultMessage = "选文件失败：\(error.localizedDescription)"
             showImportResultAlert = true
+        }
+    }
+
+    /// [message-version-groups] Import a Minis JSON export (1..n sessions)
+    /// and jump into the first created one.
+    private func startMinisImport(_ parsed: [ParsedMinisSession]) {
+        Task { @MainActor in
+            let fallbackModelId = sessions.first?.modelId ?? ""
+            let created = await ChatHistoryImporter.shared.importMinisSessions(parsed, fallbackModelId: fallbackModelId)
+            if let first = created.first {
+                refreshSessionList()
+                if created.count > 1 {
+                    importResultMessage = "导入了 \(created.count) 个会话"
+                    showImportResultAlert = true
+                }
+                openSession(first.id)
+            } else {
+                importResultMessage = "导入失败了，一条消息都没存进去"
+                showImportResultAlert = true
+            }
         }
     }
 

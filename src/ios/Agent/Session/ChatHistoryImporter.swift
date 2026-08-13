@@ -148,6 +148,63 @@ enum KelivoChatExportParser {
     }
 }
 
+// MARK: - Minis JSON export parser
+
+/// One session parsed from a Minis "Export as JSON" file.
+struct ParsedMinisSession {
+    let title: String?
+    let modelId: String?
+    /// roleName is the literal "user" / "assistant" — no role picker needed.
+    let messages: [ParsedChatMessage]
+}
+
+/// Parses the array-of-sessions JSON written by ContentView's
+/// streamExportAsJSON. Round-trip use cases: rollback safety belt (export →
+/// downgrade → delete messy session → re-import) and plain backups. Only the
+/// SELECTED version of each message ever reaches an export, so re-imports are
+/// naturally flattened to single-version history.
+enum MinisJSONExportParser {
+    /// Returns nil when the data isn't a Minis session export.
+    static func parse(_ data: Data) -> [ParsedMinisSession]? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return nil }
+        let iso = ISO8601DateFormatter()
+        var sessions: [ParsedMinisSession] = []
+        for obj in root {
+            guard let rawMessages = obj["messages"] as? [[String: Any]] else { continue }
+            var messages: [ParsedChatMessage] = []
+            for m in rawMessages {
+                guard let role = m["role"] as? String, role == "user" || role == "assistant" else { continue }
+                let timestamp = (m["createdAt"] as? String).flatMap { iso.date(from: $0) }
+                var pieces: [String] = []
+                for part in (m["parts"] as? [[String: Any]]) ?? [] {
+                    switch part["type"] as? String {
+                    case "text":
+                        if let t = part["text"] as? String, !t.isEmpty { pieces.append(t) }
+                    case "tool_use":
+                        // Exports carry no tool_use ids, so real tool blocks
+                        // can't be rebuilt — keep a readable trace instead.
+                        if let name = part["name"] as? String { pieces.append("🔧 \(name)") }
+                    case "media":
+                        pieces.append("[图片]")
+                    default:
+                        break  // tool_result: truncated in exports, dropped
+                    }
+                }
+                let body = pieces.joined(separator: "\n\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !body.isEmpty else { continue }
+                messages.append(ParsedChatMessage(roleName: role, timestamp: timestamp, text: body))
+            }
+            guard !messages.isEmpty else { continue }
+            sessions.append(ParsedMinisSession(
+                title: obj["title"] as? String,
+                modelId: obj["modelId"] as? String,
+                messages: messages
+            ))
+        }
+        return sessions.isEmpty ? nil : sessions
+    }
+}
+
 // MARK: - Importer
 
 /// Writes a parsed Kelivo export into a brand-new local session so the
@@ -212,5 +269,25 @@ final class ChatHistoryImporter {
         logger.info("[Import] Imported \(rawMessages.count) messages into session \(session.id)")
         NotificationCenter.default.post(name: .sessionDidCreate, object: session.id)
         return session
+    }
+
+    /// Import sessions parsed from a Minis JSON export. Roles are already
+    /// user/assistant, so this reuses the Kelivo pipeline with a fixed role
+    /// mapping. Returns the created sessions in file order.
+    func importMinisSessions(_ parsed: [ParsedMinisSession], fallbackModelId: String) async -> [ChatSession] {
+        var created: [ChatSession] = []
+        for sessionData in parsed {
+            let export = ParsedChatExport(
+                title: sessionData.title,
+                messages: sessionData.messages,
+                roleNames: ["user", "assistant"]
+            )
+            let modelId = (sessionData.modelId?.isEmpty == false) ? sessionData.modelId! : fallbackModelId
+            if let session = await importExport(export, userRoleName: "user", modelId: modelId) {
+                created.append(session)
+            }
+        }
+        logger.info("[Import] Minis JSON import: \(created.count)/\(parsed.count) session(s) created")
+        return created
     }
 }

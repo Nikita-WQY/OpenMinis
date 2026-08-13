@@ -301,6 +301,15 @@ struct RawMessage: Identifiable, Codable, Hashable {
     /// turn. Mirrors ChatMessage.error; persisted to the messages.error_info
     /// column so the error indicator survives reload. nil = no error.
     var errorInfo: String? = nil
+    /// [message-version-groups] One group = one logical message slot; rows
+    /// sharing a groupId are alternative versions of it. Empty means "own
+    /// group" (the launch backfill normalizes it to `id` in the DB).
+    var groupId: String = ""
+    /// 1-based version number within the group. Reroll appends max+1.
+    var version: Int = 1
+    /// Exactly one version per group is selected: it is shown in the UI and
+    /// sent as context. Enforced by ChatStore write paths, not schema.
+    var selected: Bool = true
 
     /// True if this message contains only tool results (no user text).
     /// These are internal agent loop messages that shouldn't render as user bubbles.
@@ -1018,11 +1027,13 @@ actor ChatStore {
                    (SELECT m.parts_json FROM messages m
                      WHERE m.session_id = s.id
                        AND m.role = 'assistant'
+                       AND m.selected = 1
                        AND (m.part_flags & \(asstMask)) != 0
                      ORDER BY m.sort_order DESC LIMIT 1),
                    (SELECT m.parts_json FROM messages m
                      WHERE m.session_id = s.id
                        AND m.role = 'user'
+                       AND m.selected = 1
                        AND (m.part_flags & \(userMask)) != 0
                      ORDER BY m.sort_order DESC LIMIT 1),
                    s.source, s.last_synced_at,
@@ -1032,11 +1043,13 @@ actor ChatStore {
                    (SELECT m.sort_order FROM messages m
                      WHERE m.session_id = s.id
                        AND m.role = 'assistant'
+                       AND m.selected = 1
                        AND (m.part_flags & \(asstMask)) != 0
                      ORDER BY m.sort_order DESC LIMIT 1),
                    (SELECT m.sort_order FROM messages m
                      WHERE m.session_id = s.id
                        AND m.role = 'user'
+                       AND m.selected = 1
                        AND (m.part_flags & \(userMask)) != 0
                      ORDER BY m.sort_order DESC LIMIT 1)
             FROM sessions s ORDER BY s.updated_at DESC
@@ -1950,8 +1963,8 @@ actor ChatStore {
         logger.info("[Store] appendMessages enter count=\(messages.count) dbOpen=\(dbOK) sid=\(firstSid)")
 
         let sql = """
-            INSERT INTO messages (id, session_id, role, parts_json, created_at, token_usage, sort_order, reasoning_content, stream_interrupt_count, updated_at, error_info, part_flags)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO messages (id, session_id, role, parts_json, created_at, token_usage, sort_order, reasoning_content, stream_interrupt_count, updated_at, error_info, part_flags, group_id, version, selected)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
 
         exec("BEGIN TRANSACTION")
@@ -1993,6 +2006,11 @@ actor ChatStore {
                 sqlite3_bind_double(stmt, 10, message.createdAt.timeIntervalSince1970)
                 bindOptionalText(stmt, index: 11, value: message.errorInfo)  // [T-error-persist-ios]
                 sqlite3_bind_int64(stmt, 12, Int64(partFlags))  // [T-ios-listsessions-part-flags]
+                // [message-version-groups] empty groupId = own group.
+                let effectiveGroupId = message.groupId.isEmpty ? message.id : message.groupId
+                sqlite3_bind_text(stmt, 13, (effectiveGroupId as NSString).utf8String, -1, nil)
+                sqlite3_bind_int64(stmt, 14, Int64(max(1, message.version)))
+                sqlite3_bind_int64(stmt, 15, message.selected ? 1 : 0)
                 let stepRC = sqlite3_step(stmt)
                 if stepRC != SQLITE_DONE {
                     let errMsg = String(cString: sqlite3_errmsg(db))
@@ -2053,9 +2071,12 @@ actor ChatStore {
 
     func loadMessages(sessionId: String) -> [RawMessage] {
         let totalStart = CFAbsoluteTimeGetCurrent()
+        // [message-version-groups] selected = 1 keeps the timeline to one
+        // version per group; sibling versions are fetched separately by the
+        // version pager (loadGroupVersionRows / versionCounts).
         let sql = """
-            SELECT id, session_id, role, parts_json, created_at, token_usage, reasoning_content, stream_interrupt_count, sort_order, error_info
-            FROM messages WHERE session_id = ? ORDER BY sort_order ASC, created_at ASC, id ASC
+            SELECT id, session_id, role, parts_json, created_at, token_usage, reasoning_content, stream_interrupt_count, sort_order, error_info, group_id, version, selected
+            FROM messages WHERE session_id = ? AND selected = 1 ORDER BY sort_order ASC, created_at ASC, id ASC
         """
         var stmt: OpaquePointer?
         var messages: [RawMessage] = []
@@ -2104,6 +2125,11 @@ actor ChatStore {
                 )
                 msg.sortOrder = sortOrder
                 msg.errorInfo = errorInfo
+                // [message-version-groups] NULL group_id (row written before the
+                // launch backfill ran) falls back to "own group".
+                msg.groupId = sqlite3_column_text(stmt, 10).map { String(cString: $0) } ?? id
+                msg.version = max(1, Int(sqlite3_column_int64(stmt, 11)))
+                msg.selected = sqlite3_column_int64(stmt, 12) != 0
                 messages.append(msg)
             }
         } else {
@@ -2385,9 +2411,14 @@ actor ChatStore {
             // boundary row shares its sort_order with later rows those rows are
             // NOT deleted — i.e. duplicates make truncation conservative (keep
             // more), never destructive.
+            // [message-version-groups] Count only selected rows: callers pass
+            // agentHistory.count, and agentHistory is built from loadMessages
+            // which filters selected = 1. The DELETE below still drops every
+            // row after the boundary (unselected versions included) — resend
+            // means abandoning everything after the anchor, all versions.
             let boundarySql = """
                 SELECT sort_order FROM messages
-                WHERE session_id = ?
+                WHERE session_id = ? AND selected = 1
                 ORDER BY sort_order ASC, created_at ASC, id ASC
                 LIMIT 1 OFFSET ?
                 """
@@ -3190,6 +3221,251 @@ actor ChatStore {
     /// addressed with lazy loading instead. Kept as a no-op so call sites
     /// stay untouched.
     func pruneOldMessages(sessionId: String) {
+    }
+
+    // MARK: - Message Version Groups [message-version-groups]
+
+    /// Per-group version stats for the pager: groupId → (distinct version
+    /// count, currently selected version). Only groups with more than one
+    /// version are returned — single-version groups render no pager.
+    func versionCounts(sessionId: String) -> [String: (total: Int, selectedVersion: Int)] {
+        let sql = """
+            SELECT group_id,
+                   COUNT(DISTINCT version),
+                   COALESCE(MAX(CASE WHEN selected = 1 THEN version END), 0)
+            FROM messages
+            WHERE session_id = ? AND group_id IS NOT NULL
+            GROUP BY group_id
+            HAVING COUNT(DISTINCT version) > 1
+        """
+        var stmt: OpaquePointer?
+        var result: [String: (total: Int, selectedVersion: Int)] = [:]
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            sqlite3_bind_text(stmt, 1, (sessionId as NSString).utf8String, -1, nil)
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                guard let gidC = sqlite3_column_text(stmt, 0) else { continue }
+                result[String(cString: gidC)] = (
+                    total: Int(sqlite3_column_int64(stmt, 1)),
+                    selectedVersion: Int(sqlite3_column_int64(stmt, 2))
+                )
+            }
+        }
+        sqlite3_finalize(stmt)
+        return result
+    }
+
+    /// Distinct version numbers of a group, ascending. Empty when the group
+    /// has no rows.
+    func groupVersions(sessionId: String, groupId: String) -> [Int] {
+        let sql = """
+            SELECT DISTINCT version FROM messages
+            WHERE session_id = ? AND group_id = ? ORDER BY version ASC
+        """
+        var stmt: OpaquePointer?
+        var versions: [Int] = []
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            sqlite3_bind_text(stmt, 1, (sessionId as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(stmt, 2, (groupId as NSString).utf8String, -1, nil)
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                versions.append(Int(sqlite3_column_int64(stmt, 0)))
+            }
+        }
+        sqlite3_finalize(stmt)
+        return versions
+    }
+
+    /// Deselect every row of a group. Reroll calls this before appending the
+    /// replacement rows stamped with the next version. Selection is
+    /// device-local view state (like part_flags) — not marked dirty for sync.
+    func demoteGroup(sessionId: String, groupId: String) {
+        invalidateSessionListCache()
+        let sql = "UPDATE messages SET selected = 0 WHERE session_id = ? AND group_id = ?"
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            sqlite3_bind_text(stmt, 1, (sessionId as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(stmt, 2, (groupId as NSString).utf8String, -1, nil)
+            sqlite3_step(stmt)
+        }
+        sqlite3_finalize(stmt)
+    }
+
+    /// Switch the selected version of a group, and drop the session's compact
+    /// markers: a summary describes one specific version of history, so any
+    /// marker may now describe text the user just rolled away. Dropping them
+    /// simply reverts context to full originals until the next compaction.
+    func setSelectedVersion(sessionId: String, groupId: String, version: Int) {
+        invalidateSessionListCache()
+        let sql = """
+            UPDATE messages SET selected = CASE WHEN version = ? THEN 1 ELSE 0 END
+            WHERE session_id = ? AND group_id = ?
+        """
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            sqlite3_bind_int64(stmt, 1, Int64(version))
+            sqlite3_bind_text(stmt, 2, (sessionId as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(stmt, 3, (groupId as NSString).utf8String, -1, nil)
+            sqlite3_step(stmt)
+        }
+        sqlite3_finalize(stmt)
+        logger.info("[VersionGroups] setSelectedVersion sid=\(sessionId.prefix(8)) gid=\(groupId.prefix(8)) v=\(version) changed=\(sqlite3_changes(self.db))")
+        deleteAllCompactMarkers(sessionId: sessionId)
+    }
+
+    /// Delete one version's rows from a group. If the deleted version was the
+    /// selected one, the highest remaining version becomes selected. Returns
+    /// the number of distinct versions left in the group.
+    func deleteVersion(sessionId: String, groupId: String, version: Int) -> Int {
+        invalidateSessionListCache()
+
+        // Tombstone the doomed rows for iCloud before deleting locally
+        // (mirrors deleteMessagesAfter).
+        let selSql = "SELECT id FROM messages WHERE session_id = ? AND group_id = ? AND version = ?"
+        var selStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, selSql, -1, &selStmt, nil) == SQLITE_OK {
+            sqlite3_bind_text(selStmt, 1, (sessionId as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(selStmt, 2, (groupId as NSString).utf8String, -1, nil)
+            sqlite3_bind_int64(selStmt, 3, Int64(version))
+            while sqlite3_step(selStmt) == SQLITE_ROW {
+                let msgId = String(cString: sqlite3_column_text(selStmt, 0))
+                markDirty(recordType: "Message", recordId: msgId, operation: "delete")
+            }
+        }
+        sqlite3_finalize(selStmt)
+
+        let delSql = "DELETE FROM messages WHERE session_id = ? AND group_id = ? AND version = ?"
+        var delStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, delSql, -1, &delStmt, nil) == SQLITE_OK {
+            sqlite3_bind_text(delStmt, 1, (sessionId as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(delStmt, 2, (groupId as NSString).utf8String, -1, nil)
+            sqlite3_bind_int64(delStmt, 3, Int64(version))
+            sqlite3_step(delStmt)
+        }
+        sqlite3_finalize(delStmt)
+
+        let remaining = groupVersions(sessionId: sessionId, groupId: groupId)
+        // Re-select if the selected version is gone.
+        let hasSelectedSql = "SELECT COUNT(*) FROM messages WHERE session_id = ? AND group_id = ? AND selected = 1"
+        var hasStmt: OpaquePointer?
+        var selectedCount = 0
+        if sqlite3_prepare_v2(db, hasSelectedSql, -1, &hasStmt, nil) == SQLITE_OK {
+            sqlite3_bind_text(hasStmt, 1, (sessionId as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(hasStmt, 2, (groupId as NSString).utf8String, -1, nil)
+            if sqlite3_step(hasStmt) == SQLITE_ROW {
+                selectedCount = Int(sqlite3_column_int64(hasStmt, 0))
+            }
+        }
+        sqlite3_finalize(hasStmt)
+        if selectedCount == 0, let fallback = remaining.last {
+            setSelectedVersion(sessionId: sessionId, groupId: groupId, version: fallback)
+        } else {
+            deleteAllCompactMarkers(sessionId: sessionId)
+        }
+        logger.info("[VersionGroups] deleteVersion sid=\(sessionId.prefix(8)) gid=\(groupId.prefix(8)) v=\(version) remaining=\(remaining.count)")
+        return remaining.count
+    }
+
+    /// Reroll support: turn every row AFTER the first `keepCount` selected
+    /// rows into a demoted version of one group, and hand back the stamp the
+    /// replacement rows must carry. Boundary resolution mirrors
+    /// deleteMessagesAfter (keepCount counts SELECTED rows, callers pass the
+    /// trimmed agentHistory.count) — this is the non-destructive sibling of
+    /// that method: instead of deleting the tail, it becomes version history.
+    ///
+    /// First reroll: tail rows still sit in their own single-row groups from
+    /// the batch-0 backfill; they all get re-stamped onto the first tail row's
+    /// group. Later rerolls: the tail already shares that group, the UPDATE is
+    /// a no-op re-stamp. Returns nil when there is nothing after the boundary.
+    func versionizeMessagesAfter(sessionId: String, keepCount: Int) -> (groupId: String, nextVersion: Int)? {
+        guard keepCount > 0 else { return nil }
+        invalidateSessionListCache()
+
+        let boundarySql = """
+            SELECT sort_order FROM messages
+            WHERE session_id = ? AND selected = 1
+            ORDER BY sort_order ASC, created_at ASC, id ASC
+            LIMIT 1 OFFSET ?
+            """
+        var bStmt: OpaquePointer?
+        var boundary: Int64? = nil
+        if sqlite3_prepare_v2(db, boundarySql, -1, &bStmt, nil) == SQLITE_OK {
+            sqlite3_bind_text(bStmt, 1, (sessionId as NSString).utf8String, -1, nil)
+            sqlite3_bind_int64(bStmt, 2, Int64(keepCount - 1))
+            if sqlite3_step(bStmt) == SQLITE_ROW {
+                boundary = sqlite3_column_int64(bStmt, 0)
+            }
+        }
+        sqlite3_finalize(bStmt)
+        guard let boundary else { return nil }
+
+        // Group of the first tail row (canonical order) = the group every
+        // tail row joins.
+        let firstSql = """
+            SELECT group_id, id FROM messages
+            WHERE session_id = ? AND sort_order > ?
+            ORDER BY sort_order ASC, created_at ASC, id ASC LIMIT 1
+            """
+        var fStmt: OpaquePointer?
+        var groupId: String? = nil
+        if sqlite3_prepare_v2(db, firstSql, -1, &fStmt, nil) == SQLITE_OK {
+            sqlite3_bind_text(fStmt, 1, (sessionId as NSString).utf8String, -1, nil)
+            sqlite3_bind_int64(fStmt, 2, boundary)
+            if sqlite3_step(fStmt) == SQLITE_ROW {
+                groupId = sqlite3_column_text(fStmt, 0).map { String(cString: $0) }
+                    ?? String(cString: sqlite3_column_text(fStmt, 1))
+            }
+        }
+        sqlite3_finalize(fStmt)
+        guard let groupId else { return nil }
+
+        let updateSql = """
+            UPDATE messages SET group_id = ?, selected = 0
+            WHERE session_id = ? AND sort_order > ?
+        """
+        var uStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, updateSql, -1, &uStmt, nil) == SQLITE_OK {
+            sqlite3_bind_text(uStmt, 1, (groupId as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(uStmt, 2, (sessionId as NSString).utf8String, -1, nil)
+            sqlite3_bind_int64(uStmt, 3, boundary)
+            sqlite3_step(uStmt)
+        }
+        sqlite3_finalize(uStmt)
+        let demoted = Int(sqlite3_changes(db))
+
+        var maxVer = 0
+        let maxSql = "SELECT COALESCE(MAX(version), 0) FROM messages WHERE session_id = ? AND group_id = ?"
+        var mStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, maxSql, -1, &mStmt, nil) == SQLITE_OK {
+            sqlite3_bind_text(mStmt, 1, (sessionId as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(mStmt, 2, (groupId as NSString).utf8String, -1, nil)
+            if sqlite3_step(mStmt) == SQLITE_ROW {
+                maxVer = Int(sqlite3_column_int64(mStmt, 0))
+            }
+        }
+        sqlite3_finalize(mStmt)
+
+        // A reroll rewrites this suffix of history, so any summary of it is
+        // stale (same reasoning as setSelectedVersion).
+        deleteAllCompactMarkers(sessionId: sessionId)
+
+        logger.info("[VersionGroups] versionize sid=\(sessionId.prefix(8)) gid=\(groupId.prefix(8)) demoted=\(demoted) nextVersion=\(maxVer + 1)")
+        return (groupId, maxVer + 1)
+    }
+
+    /// Drop every compact marker of a session (version switches invalidate
+    /// summaries wholesale — cheaper and safer than range math, and she wants
+    /// originals over summaries anyway).
+    func deleteAllCompactMarkers(sessionId: String) {
+        let sql = "DELETE FROM compact_markers WHERE session_id = ?"
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            sqlite3_bind_text(stmt, 1, (sessionId as NSString).utf8String, -1, nil)
+            sqlite3_step(stmt)
+        }
+        sqlite3_finalize(stmt)
+        let dropped = Int(sqlite3_changes(db))
+        if dropped > 0 {
+            logger.info("[VersionGroups] dropped \(dropped) compact marker(s) sid=\(sessionId.prefix(8))")
+        }
     }
 
     /// Delete all compact markers except the latest one.

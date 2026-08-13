@@ -1966,6 +1966,15 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// async hop to the actor. Empty string means "not yet loaded" — treat as
     /// no fallback.
     var cachedSessionModelId: String = ""
+    /// [message-version-groups] Set by rerollLastReply for the duration of the
+    /// regeneration: every row buildRawMessage persists during this run joins
+    /// `groupId` as version `version` (selected). Cleared when the run's
+    /// epilogue finishes or a fresh user turn starts.
+    var pendingVersionStamp: (groupId: String, version: Int)?
+    /// [message-version-groups] Per-group pager data for the CURRENT session:
+    /// groupId → (total versions, selected version). Only multi-version groups
+    /// are present. Refreshed by loadSession and after reroll/switch/delete.
+    @Published var versionInfoByGroup: [String: (total: Int, selectedVersion: Int)] = [:]
     /// The ModelEntry used in the current/last agent loop, for rebuilding the provider.
     var keepAliveEntry: ModelEntry?
     /// Pending thought signatures loaded from persisted session, keyed by tool call ID.
@@ -2068,6 +2077,10 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             logger.warning("🔑DRAFT [vm=\(self.vmInstanceId)] send() GUARD FAILED — text.isEmpty=\(text.isEmpty) attachments.isEmpty=\(pendingAttachments.isEmpty) isProcessing=\(self.isProcessing)")
             return
         }
+
+        // [message-version-groups] A fresh user turn must never inherit a
+        // reroll stamp — its rows are their own new groups.
+        pendingVersionStamp = nil
 
         // Don't stop TTS here — let the previous reply finish playing. The stream
         // handler will clear the queue on the FIRST textDelta of the new reply, so
@@ -3122,10 +3135,130 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                 return
             }
             await self.drainQueuedPrompts()
+            // [message-version-groups] The regenerated turn is fully persisted;
+            // retire the stamp and give the fresh bubble its group so the
+            // pager can render without waiting for a session reload.
+            if let stamp = self.pendingVersionStamp {
+                self.pendingVersionStamp = nil
+                self.messages.last(where: { $0.role == .assistant })?.groupId = stamp.groupId
+                self.refreshVersionInfo()
+            }
             logger.info("🔄SESSION [vm=\(self.vmInstanceId)] \(label) DONE session=\(self.sessionId ?? "nil")")
             self.playCompletionHaptic()
             self.isProcessing = false
             self.endBackgroundProcessing()
+        }
+    }
+
+    /// [message-version-groups] Kelivo-style reroll of the LAST assistant
+    /// reply: the current turn's persisted rows become a demoted version of
+    /// one group (nothing is deleted) and a fresh generation is appended as
+    /// the group's next selected version. In-memory truncation mirrors
+    /// retryFromMessage; the DB side goes through versionizeMessagesAfter
+    /// instead of deleteMessagesAfter.
+    func rerollLastReply() {
+        guard !isProcessing else { return }
+        guard let sessionId else { return }
+        // Only the last reply is rerollable in batch 1: the last UI message
+        // must be an assistant bubble with a preceding user bubble.
+        guard let lastMsg = messages.last, lastMsg.role == .assistant,
+              let userIdx = messages.dropLast().lastIndex(where: { $0.role == .user }) else { return }
+
+        isTruncatingForRetry = true
+        canResume = false
+        userDidCancel = false
+
+        // Trim UI after the anchoring user message.
+        messages.removeSubrange((userIdx + 1)...)
+        if !transitionSuspended { objectWillChange.send() }
+
+        // Trim agentHistory to the anchor — same user-bubble walk as
+        // retryFromMessage.
+        let targetUserCount = messages[...userIdx].filter { $0.role == .user }.count
+        var usersSeen = 0
+        var keepUpTo = -1
+        for (i, entry) in agentHistory.enumerated() {
+            if Self.isUserBubbleEntry(entry) { usersSeen += 1 }
+            if usersSeen == targetUserCount { keepUpTo = i; break }
+        }
+        guard keepUpTo >= 0 else {
+            // UI↔history mismatch. Unlike retryFromMessage we cannot fail open:
+            // regenerating without demoting the old rows would leave two
+            // selected replies in the DB. Restore state from disk and bail.
+            logger.error("[VersionGroups] reroll anchor NOT FOUND (targetUserCount=\(targetUserCount)) — reloading session, reroll aborted")
+            isTruncatingForRetry = false
+            Task { await self.loadSession() }
+            return
+        }
+        if keepUpTo + 1 < agentHistory.count {
+            agentHistory.removeSubrange((keepUpTo + 1)...)
+        }
+
+        let persistedKeepCount = agentHistory.count
+        rebuildToolSnapshotsFromMessages()
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            // Demote the old turn BEFORE launching the rerun so the stamp is
+            // in place before any new row can persist.
+            if let stamp = await ChatStore.shared.versionizeMessagesAfter(sessionId: sessionId, keepCount: persistedKeepCount) {
+                self.pendingVersionStamp = stamp
+            } else {
+                logger.warning("[VersionGroups] versionize found nothing after boundary keepCount=\(persistedKeepCount) — reroll proceeds unstamped")
+            }
+            self.isTruncatingForRetry = false
+            self.launchRerunAgentLoop(label: "rerollLastReply")
+        }
+    }
+
+    /// [message-version-groups] Refresh the pager data (multi-version groups
+    /// of the current session) from the DB and stamp it onto the bubbles —
+    /// ChatMessage.versionInfo is @Published, so footers re-render on their
+    /// own without a cell-bridge round trip.
+    func refreshVersionInfo() {
+        guard let sessionId else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let counts = await ChatStore.shared.versionCounts(sessionId: sessionId)
+            self.versionInfoByGroup = counts
+            // Version numbers can be non-contiguous after deletions, so the
+            // pager needs the actual list, not just a count.
+            var infos: [String: MessageVersionInfo] = [:]
+            for (gid, entry) in counts {
+                let versions = await ChatStore.shared.groupVersions(sessionId: sessionId, groupId: gid)
+                infos[gid] = MessageVersionInfo(versions: versions, selected: entry.selectedVersion)
+            }
+            for msg in self.messages where msg.role == .assistant {
+                if let gid = msg.groupId { msg.versionInfo = infos[gid] } else { msg.versionInfo = nil }
+            }
+        }
+    }
+
+    /// [message-version-groups] Switch the selected version of a group and
+    /// rebuild the session view (UI bubbles + agentHistory) from the DB.
+    func selectVersion(groupId: String, version: Int) {
+        guard !isProcessing, let sessionId else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await ChatStore.shared.setSelectedVersion(sessionId: sessionId, groupId: groupId, version: version)
+            self.cachedLatestMarker = nil  // markers were dropped with the switch
+            await self.loadSession()
+            self.refreshVersionInfo()
+        }
+    }
+
+    /// [message-version-groups] Delete one version of a group (the selected
+    /// one included — the highest remaining version takes over). The group's
+    /// last remaining version cannot be deleted from this path.
+    func deleteVersion(groupId: String, version: Int) {
+        guard !isProcessing, let sessionId else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let remaining = await ChatStore.shared.deleteVersion(sessionId: sessionId, groupId: groupId, version: version)
+            logger.info("[VersionGroups] deleteVersion via vm gid=\(groupId.prefix(8)) v=\(version) remaining=\(remaining)")
+            self.cachedLatestMarker = nil
+            await self.loadSession()
+            self.refreshVersionInfo()
         }
     }
 

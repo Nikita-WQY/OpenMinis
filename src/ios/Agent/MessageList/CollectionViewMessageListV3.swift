@@ -31,6 +31,10 @@ struct CollectionViewMessageListV3: UIViewControllerRepresentable {
     var onRevertCompact: (() -> Void)?
     var onForceSync: (() -> Void)?
     var onScreenshotImage: ((UIImage) -> Void)?
+    // [message-version-groups]
+    var onSelectVersion: ((String, Int) -> Void)?
+    var onRerollLast: (() -> Void)?
+    var onDeleteVersion: ((String, Int) -> Void)?
     var maxContentWidth: CGFloat
     var floatingBarHeight: CGFloat
     var inputBarHeight: CGFloat
@@ -68,6 +72,9 @@ struct CollectionViewMessageListV3: UIViewControllerRepresentable {
         coord.onStop = onStop
         coord.onCompact = onCompact
         coord.onRevertCompact = onRevertCompact
+        coord.onSelectVersion = onSelectVersion
+        coord.onRerollLast = onRerollLast
+        coord.onDeleteVersion = onDeleteVersion
         coord.onForceSync = onForceSync
         coord.onScreenshotImage = onScreenshotImage
         coord.maxContentWidth = maxContentWidth
@@ -351,6 +358,15 @@ private struct BridgedAssistantFooterV3: View {
         }
     }
 
+    /// [message-version-groups] Pager renders when the bubble's group holds
+    /// more than one version and the app is idle enough for switching to be
+    /// safe (onSelectVersion is nil while processing).
+    private var pagerInfo: MessageVersionInfo? {
+        guard let info = message.versionInfo, info.total > 1,
+              bridge.onSelectVersion != nil else { return nil }
+        return info
+    }
+
     /// True when any of the footer's conditional sections will actually
     /// render. When false the footer should collapse to zero height so it
     /// doesn't insert a phantom 4pt gap between the last assistant block
@@ -360,7 +376,7 @@ private struct BridgedAssistantFooterV3: View {
         let showError = message.error != nil
         let showResume = bridge.canResume && message.error == nil
         let showUsageRow = message.streamInterruptCount > 0 || bridge.showUsage
-        return showTyping || showError || showResume || showUsageRow
+        return showTyping || showError || showResume || showUsageRow || pagerInfo != nil
     }
 
     var body: some View {
@@ -378,6 +394,14 @@ private struct BridgedAssistantFooterV3: View {
             // Resume banner
             if bridge.canResume && message.error == nil {
                 resumeBanner
+            }
+
+            // [message-version-groups] ‹ n/N › version pager
+            if let info = pagerInfo {
+                VersionPagerV3(
+                    info: info,
+                    onSelectVersion: bridge.onSelectVersion
+                )
             }
 
             // Token usage
@@ -446,6 +470,24 @@ private struct BridgedAssistantFooterV3: View {
                             onForceSync()
                         } label: {
                             Label(String(localized: "Force Sync"), systemImage: "arrow.triangle.2.circlepath.icloud")
+                        }
+                    }
+                    // [message-version-groups] Regenerate (last reply only)
+                    if let onRerollLast = bridge.onRerollLast {
+                        Divider()
+                        Button {
+                            onRerollLast()
+                        } label: {
+                            Label(String(localized: "Regenerate"), systemImage: "arrow.counterclockwise")
+                        }
+                    }
+                    // [message-version-groups] Delete the selected version
+                    // (only when siblings exist to fall back to).
+                    if bridge.onDeleteVersion != nil, (message.versionInfo?.total ?? 0) > 1 {
+                        Button(role: .destructive) {
+                            bridge.onDeleteVersion?()
+                        } label: {
+                            Label(String(localized: "Delete This Version"), systemImage: "trash")
                         }
                     }
                     if let onCompact = bridge.onCompact {
@@ -566,6 +608,49 @@ private struct BridgedAssistantFooterV3: View {
     }
 }
 
+/// [message-version-groups] ‹ n/N › version pager rendered in the assistant
+/// footer (Kelivo-style). Steps through the group's EXISTING version list by
+/// index — version numbers can be non-contiguous after deletions.
+private struct VersionPagerV3: View {
+    let info: MessageVersionInfo
+    var onSelectVersion: ((Int) -> Void)?
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Button {
+                if let prev = info.previousVersion { onSelectVersion?(prev) }
+            } label: {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 12, weight: .semibold))
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
+            }
+            .disabled(info.previousVersion == nil)
+            .opacity(info.previousVersion == nil ? 0.3 : 1)
+
+            Text("\(info.selectedIndex + 1)/\(info.total)")
+                .font(.system(size: 12, design: .monospaced))
+
+            Button {
+                if let next = info.nextVersion { onSelectVersion?(next) }
+            } label: {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 12, weight: .semibold))
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
+            }
+            .disabled(info.nextVersion == nil)
+            .opacity(info.nextVersion == nil ? 0.3 : 1)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(Color.secondary.opacity(0.08))
+        .clipShape(Capsule())
+    }
+}
+
 /// Wraps the existing ChatMessageRow for user / compactDivider / systemInfo messages.
 /// V3: No GeometryReader.
 private struct BridgedWholeMessageV3: View {
@@ -629,6 +714,10 @@ extension CollectionViewMessageListV3 {
         var onRevertCompact: (() -> Void)?
         var onForceSync: (() -> Void)?
         var onScreenshotImage: ((UIImage) -> Void)?
+        // [message-version-groups]
+        var onSelectVersion: ((String, Int) -> Void)?
+        var onRerollLast: (() -> Void)?
+        var onDeleteVersion: ((String, Int) -> Void)?
         var maxContentWidth: CGFloat = 0
         var lastInputFocused: Bool = false
 
@@ -1238,6 +1327,7 @@ extension CollectionViewMessageListV3 {
 
             if message.isCompactedHistory || message.role == .compactDivider || message.role == .systemInfo {
                 bridge.onRetry = nil; bridge.onEdit = nil; bridge.onCompact = nil
+                bridge.onSelectVersion = nil; bridge.onRerollLast = nil; bridge.onDeleteVersion = nil
             } else if !vm.isProcessing && !vm.isCompacting {
                 if message.role == .user {
                     bridge.onRetry = { retryMsg?(message.id) }
@@ -1248,8 +1338,30 @@ extension CollectionViewMessageListV3 {
                 }
                 bridge.onEdit = message.role == .user ? { edit?(message.id) } : nil
                 bridge.onCompact = { compact?(message.id) }
+                // [message-version-groups] Pager + reroll wiring. groupId /
+                // versionInfo are read at TAP time from the message so a
+                // bridge configured before refreshVersionInfo lands still
+                // acts on fresh data.
+                if message.role == .assistant {
+                    let selectVersion = onSelectVersion
+                    let deleteVersion = onDeleteVersion
+                    let rerollLast = onRerollLast
+                    bridge.onSelectVersion = { [weak message] v in
+                        guard let gid = message?.groupId else { return }
+                        selectVersion?(gid, v)
+                    }
+                    bridge.onDeleteVersion = { [weak message] in
+                        guard let m = message, let gid = m.groupId,
+                              let info = m.versionInfo, info.total > 1 else { return }
+                        deleteVersion?(gid, info.selected)
+                    }
+                    bridge.onRerollLast = isLast ? { rerollLast?() } : nil
+                } else {
+                    bridge.onSelectVersion = nil; bridge.onRerollLast = nil; bridge.onDeleteVersion = nil
+                }
             } else {
                 bridge.onRetry = nil; bridge.onEdit = nil; bridge.onCompact = nil
+                bridge.onSelectVersion = nil; bridge.onRerollLast = nil; bridge.onDeleteVersion = nil
             }
         }
 
